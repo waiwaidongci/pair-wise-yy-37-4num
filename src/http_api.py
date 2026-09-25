@@ -98,6 +98,32 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/equipment":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    kind = query.get("kind", [None])[0]
+                    self._json(200, {"equipment": service.list_equipment(role, kind)})
+                elif path.startswith("/api/equipment/"):
+                    equipment_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_equipment(equipment_id, role))
+                elif path == "/api/outages":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    def _opt(name):
+                        value = query.get(name, [None])[0]
+                        return int(value) if value is not None else None
+                    self._json(200, {"outages": service.list_outages(
+                        role, query.get("status", [None])[0],
+                        _opt("item_id"), _opt("equipment_id"))})
+                elif path.startswith("/api/outages/"):
+                    outage_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_outage(outage_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +136,23 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/equipment":
+                    self._json(201, service.register_equipment(body, actor, role))
+                elif path == "/api/outages":
+                    self._json(201, service.create_outage(body, actor, role))
+                elif path.startswith("/api/outages/") and path.endswith("/review"):
+                    outage_id = int(path.split("/")[3])
+                    self._json(200, service.review_outage(outage_id, body, actor, role))
+                elif path.startswith("/api/outages/") and path.endswith("/extend"):
+                    outage_id = int(path.split("/")[3])
+                    self._json(200, service.extend_outage(outage_id, body, actor, role))
+                elif path.startswith("/api/outages/") and path.endswith("/resume"):
+                    outage_id = int(path.split("/")[3])
+                    self._json(200, service.resume_outage(outage_id, body, actor, role))
+                elif path.startswith("/api/outages/") and path.endswith("/quantity"):
+                    outage_id = int(path.split("/")[3])
+                    self._json(200, service.change_outage_quantity(
+                        outage_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

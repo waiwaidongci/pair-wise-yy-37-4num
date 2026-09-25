@@ -98,6 +98,21 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/shutdown-reports":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    status = query.get("status", [None])[0]
+                    item_id = query.get("item_id", [None])[0]
+                    if item_id is not None:
+                        item_id = int(item_id)
+                    self._json(200, {"reports": service.list_shutdown_reports(
+                        role, status, item_id)})
+                elif path.startswith("/api/shutdown-reports/"):
+                    report_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_shutdown_report(report_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +134,18 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/shutdown-reports":
+                    self._json(201, service.create_shutdown_report(body, actor, role))
+                elif (path.startswith("/api/shutdown-reports/")
+                      and path.endswith("/review")):
+                    report_id = int(path.split("/")[3])
+                    self._json(200, service.review_shutdown_report(
+                        report_id, body, actor, role))
+                elif (path.startswith("/api/shutdown-reports/")
+                      and path.endswith("/amend")):
+                    report_id = int(path.split("/")[3])
+                    self._json(200, service.amend_shutdown_report(
+                        report_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

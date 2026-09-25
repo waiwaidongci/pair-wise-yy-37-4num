@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, SHUTDOWN_STATUSES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        shutdown_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in SHUTDOWN_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -54,6 +55,37 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS shutdown_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    equipment_id TEXT NOT NULL,
+                    equipment_name TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    backup_device_id TEXT,
+                    backup_device_name TEXT,
+                    backup_capacity REAL NOT NULL DEFAULT 0,
+                    affected_quantity REAL NOT NULL DEFAULT 0,
+                    capacity_margin REAL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ({shutdown_statuses})),
+                    decision_note TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_shutdown_status ON shutdown_reports(status);
+                CREATE INDEX IF NOT EXISTS ix_shutdown_item ON shutdown_reports(item_id);
+                CREATE TABLE IF NOT EXISTS shutdown_outlets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_id INTEGER NOT NULL REFERENCES shutdown_reports(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    outlet_code TEXT NOT NULL,
+                    declared_quantity REAL NOT NULL DEFAULT 0,
+                    UNIQUE(report_id, outlet_code)
+                );
+                CREATE INDEX IF NOT EXISTS ix_shutdown_outlets_item ON shutdown_outlets(item_id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -156,6 +188,149 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_shutdown_report(self, item_id: int, equipment_id: str, equipment_name: str,
+                               period_start: str, period_end: str,
+                               backup_device_id: Optional[str], backup_device_name: Optional[str],
+                               backup_capacity: float, affected_quantity: float,
+                               outlets: List[Dict[str, Any]], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO shutdown_reports(item_id, equipment_id, equipment_name,
+                   period_start, period_end, backup_device_id, backup_device_name,
+                   backup_capacity, affected_quantity, capacity_margin, status, decision_note,
+                   version, created_by, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,1,?,?,?)""",
+                (item_id, equipment_id, equipment_name, period_start, period_end,
+                 backup_device_id, backup_device_name, backup_capacity, affected_quantity,
+                 round(backup_capacity - affected_quantity, 6), "pending", actor, now, now),
+            )
+            report_id = int(cur.lastrowid)
+            self._replace_outlets(report_id, outlets)
+        return self.get_shutdown_report(report_id)
+
+    def _replace_outlets(self, report_id: int, outlets: List[Dict[str, Any]]) -> None:
+        self.conn.executemany(
+            """INSERT INTO shutdown_outlets(report_id, item_id, outlet_code, declared_quantity)
+               VALUES(?,?,?,?)""",
+            [(report_id, outlet["item_id"], outlet["outlet_code"], outlet["declared_quantity"])
+             for outlet in outlets],
+        )
+
+    def _shutdown_outlets(self, report_id: int) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM shutdown_outlets WHERE report_id=? ORDER BY id", (report_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_shutdown_report(self, report_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM shutdown_reports WHERE id=?", (report_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("停运报备不存在")
+            report = dict(row)
+            report["outlets"] = self._shutdown_outlets(report_id)
+        return report
+
+    def list_shutdown_reports(self, status: Optional[str] = None,
+                              item_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM shutdown_reports"
+        clauses = []
+        params: List[Any] = []
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if item_id is not None:
+            clauses.append("item_id=?")
+            params.append(item_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+            result = []
+            for row in rows:
+                report = dict(row)
+                report["outlets"] = self._shutdown_outlets(report["id"])
+                result.append(report)
+        return result
+
+    def unconfirmed_shutdown_report_ids(self, item_id: int) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT r.id FROM shutdown_reports r
+                   LEFT JOIN shutdown_outlets o ON o.report_id=r.id
+                   WHERE r.status != 'confirmed'
+                     AND (r.item_id=? OR o.item_id=?)
+                   GROUP BY r.id ORDER BY r.id""",
+                (item_id, item_id),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def review_shutdown_report(self, report_id: int, status: str, decision_note: Optional[str],
+                               capacity_margin_value: Optional[float],
+                               expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE shutdown_reports SET status=?, decision_note=?, capacity_margin=?,
+                   version=version+1, updated_at=?
+                   WHERE id=? AND version=? AND status='pending'""",
+                (status, decision_note, capacity_margin_value, now,
+                 report_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM shutdown_reports WHERE id=?", (report_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("停运报备不存在")
+                raise ConflictError("版本冲突或报备不在待审状态")
+        return self.get_shutdown_report(report_id)
+
+    def amend_shutdown_report(self, report_id: int, values: Dict[str, Any],
+                              outlets: Optional[List[Dict[str, Any]]],
+                              expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        fields = []
+        params: List[Any] = []
+        for column in ("equipment_id", "equipment_name", "period_start", "period_end",
+                       "backup_device_id", "backup_device_name", "backup_capacity",
+                       "affected_quantity"):
+            if column in values:
+                fields.append(f"{column}=?")
+                params.append(values[column])
+        if "backup_capacity" in values or "affected_quantity" in values:
+            fields.append("capacity_margin=?")
+            params.append(round(float(values["backup_capacity"])
+                                - float(values["affected_quantity"]), 6))
+        fields.append("status='pending'")
+        fields.append("decision_note=NULL")
+        fields.append("version=version+1")
+        fields.append("updated_at=?")
+        params.append(now)
+        params.extend([report_id, expected_version])
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                f"UPDATE shutdown_reports SET {', '.join(fields)} WHERE id=? AND version=?",
+                tuple(params),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM shutdown_reports WHERE id=?", (report_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("停运报备不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+            if outlets is not None:
+                self.conn.execute(
+                    "DELETE FROM shutdown_outlets WHERE report_id=?", (report_id,)
+                )
+                self._replace_outlets(report_id, outlets)
+        return self.get_shutdown_report(report_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

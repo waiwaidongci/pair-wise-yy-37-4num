@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
 class DomainError(Exception):
@@ -11,12 +12,19 @@ class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
 SEVERITIES=['low', 'medium', 'high', 'critical']; STATES=['draft', 'submitted', 'inspection', 'correction', 'approved']; ROLES=['applicant', 'inspector', 'compliance_manager', 'viewer']
+SHUTDOWN_STATUSES=['pending', 'confirmed', 'returned']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
 @dataclass(frozen=True)
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
+@dataclass(frozen=True)
+class ShutdownReport:
+    id:int; item_id:int; equipment_id:str; equipment_name:str; period_start:str; period_end:str; backup_device_id:str; backup_device_name:str; backup_capacity:float; affected_quantity:float; capacity_margin:Optional[float]; status:str; decision_note:Optional[str]; version:int; created_by:str; created_at:str; updated_at:str
+@dataclass(frozen=True)
+class ShutdownOutlet:
+    id:int; report_id:int; item_id:int; outlet_code:str; declared_quantity:float
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
@@ -36,3 +44,16 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+def parse_instant(value,field):
+    if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
+    text=value.strip()
+    if text.endswith("Z"): text=text[:-1]+"+00:00"
+    try: dt=datetime.fromisoformat(text)
+    except ValueError as exc: raise ValidationError(f"{field}必须是ISO 8601时间") from exc
+    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+def require_period(start_value,end_value):
+    start=parse_instant(start_value,"period_start")
+    end=parse_instant(end_value,"period_end")
+    if end<=start: raise ValidationError("period_end必须晚于period_start")
+    return start.replace(microsecond=0).isoformat(),end.replace(microsecond=0).isoformat()
